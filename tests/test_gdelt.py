@@ -2,6 +2,7 @@
 import logging
 import os
 import sys
+import threading
 
 import pandas as pd
 import pytest
@@ -118,11 +119,22 @@ def test_gdelt_failure_cooldown_avoids_repeated_network_calls(monkeypatch, gdelt
 def test_dashboard_renders_other_tabs_when_gdelt_fails(monkeypatch):
     from streamlit.testing.v1 import AppTest
 
-    def fail_news(*args, **kwargs):
-        raise sources.SourceError("Global news is temporarily unavailable.")
+    started = threading.Event()
+    release = threading.Event()
 
+    def fail_news(*args, **kwargs):
+        started.set()
+        release.wait(timeout=10)
+        raise sources.SourceError("Global news (GDELT) is temporarily unavailable.")
+
+    def fail_timeline(*args, **kwargs):
+        raise sources.SourceError("Global news (GDELT) is temporarily unavailable.")
+
+    # Preserve cache filenames so this also exercises the stale-copy fallback.
+    fail_news.__name__ = "fetch_news"
+    fail_timeline.__name__ = "fetch_news_timeline"
     monkeypatch.setattr(sources, "fetch_news", fail_news)
-    monkeypatch.setattr(sources, "fetch_news_timeline", fail_news)
+    monkeypatch.setattr(sources, "fetch_news_timeline", fail_timeline)
     monkeypatch.setattr(
         sources, "fetch_hn",
         lambda *args, **kwargs: pd.DataFrame(
@@ -141,6 +153,17 @@ def test_dashboard_renders_other_tabs_when_gdelt_fails(monkeypatch):
         os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py"),
         default_timeout=60,
     ).run()
+
+    future = app.session_state.get("_gdelt_future")
+    assert started.wait(timeout=3)
+    assert future is not None and not future.done()
+    assert not app.exception
+    assert len(app.tabs) == 6
+
+    release.set()
+    if future is not None:
+        future.result(timeout=10)
+        app.run()
 
     assert not app.exception
     assert len(app.tabs) == 6

@@ -7,6 +7,7 @@ Layout: a sidebar with filters, and six tabs:
 
 import hashlib
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -92,6 +93,39 @@ def safe(fn, *args):
 stale_notes: list[str] = []
 
 
+@st.cache_resource
+def gdelt_executor():
+    """Run GDELT off the Streamlit script thread so other sources can render."""
+    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="gdelt")
+
+
+def _fetch_gdelt_data(terms, country, timespan):
+    first_new_note = len(stale_notes)
+    news, news_err = safe(src.fetch_news, terms, country, timespan)
+    timeline, timeline_err = safe(src.fetch_news_timeline, terms, country, timespan)
+    failed = bool(
+        news_err or timeline_err
+        or any("global news (gdelt)" in note.lower() for note in stale_notes[first_new_note:])
+    )
+    return news, news_err, timeline, timeline_err, failed
+
+
+def _gdelt_completion_watch():
+    future = st.session_state.get("_gdelt_future")
+    if future is None:
+        return
+    if future.done():
+        try:
+            st.session_state["_gdelt_result"] = future.result()
+        except Exception as exc:
+            message = f"Global news (GDELT) is temporarily unavailable ({exc.__class__.__name__})."
+            st.session_state["_gdelt_result"] = (None, message, None, message, True)
+        st.session_state["_gdelt_future"] = None
+        st.rerun()
+    else:
+        st.caption("Global news is loading in the background; other sources are available meanwhile.")
+
+
 # --------------------------------------------------------------------------- #
 # Sidebar
 # --------------------------------------------------------------------------- #
@@ -145,11 +179,36 @@ Data refreshes hourly. Always open the source links before relying on anything h
 # --------------------------------------------------------------------------- #
 # Fetch data (each source fails independently)
 # --------------------------------------------------------------------------- #
-with st.spinner("Gathering global news coverage… GDELT requests have a short timeout and one retry."):
-    news, news_err = safe(src.fetch_news, news_terms, reg["gdelt_country"], win["gdelt"])
-    timeline, timeline_err = safe(src.fetch_news_timeline, news_terms, reg["gdelt_country"], win["gdelt"])
+gdelt_key = (news_terms, reg["gdelt_country"], win["gdelt"])
+if st.session_state.get("_gdelt_key") != gdelt_key:
+    st.session_state["_gdelt_key"] = gdelt_key
+    st.session_state["_gdelt_result"] = None
+    st.session_state["_gdelt_future"] = gdelt_executor().submit(
+        _fetch_gdelt_data, news_terms, reg["gdelt_country"], win["gdelt"])
+
+gdelt_future = st.session_state.get("_gdelt_future")
+gdelt_result = st.session_state.get("_gdelt_result")
+if gdelt_result is None and gdelt_future is not None and gdelt_future.done():
+    try:
+        gdelt_result = gdelt_future.result()
+    except Exception as exc:
+        message = f"Global news (GDELT) is temporarily unavailable ({exc.__class__.__name__})."
+        gdelt_result = (None, message, None, message, True)
+    st.session_state["_gdelt_result"] = gdelt_result
+    st.session_state["_gdelt_future"] = None
+    gdelt_future = None
+
+if gdelt_result is None:
+    news, news_err = None, None
+    timeline, timeline_err = None, None
+else:
+    news, news_err, timeline, timeline_err, gdelt_failed = gdelt_result
+
+gdelt_pending = gdelt_future is not None
+if gdelt_pending:
+    st.fragment(run_every=1)(_gdelt_completion_watch)()
 gdelt_unavailable = bool(
-    news_err or timeline_err
+    (gdelt_result is not None and gdelt_failed) or news_err or timeline_err
     or any("global news (gdelt) is temporarily unavailable" in note.lower() for note in stale_notes)
 )
 news = news if news is not None else pd.DataFrame(columns=["title", "url", "outlet", "published", "source_country", "outlets_carrying"])
@@ -187,6 +246,8 @@ tabs = st.tabs(["📊 Pulse Overview", "📰 Top Stories & Topics", "💼 Jobs",
 with tabs[0]:
     if gdelt_unavailable:
         st.warning("Global news is temporarily unavailable, showing other sources")
+    elif gdelt_pending:
+        st.info("Global news is loading in the background; other sources are available meanwhile.")
     for note in stale_notes:
         st.info(note, icon="🕒")
     c1, c2, c3, c4 = st.columns(4)
