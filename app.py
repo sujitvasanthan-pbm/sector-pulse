@@ -95,8 +95,8 @@ stale_notes: list[str] = []
 
 @st.cache_resource
 def gdelt_executor():
-    """Run GDELT off the Streamlit script thread so other sources can render."""
-    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="gdelt")
+    """Run the independent news feeds off the Streamlit script thread."""
+    return ThreadPoolExecutor(max_workers=2, thread_name_prefix="news")
 
 
 def _fetch_gdelt_data(terms, country, timespan):
@@ -110,19 +110,35 @@ def _fetch_gdelt_data(terms, country, timespan):
     return news, news_err, timeline, timeline_err, failed
 
 
+def _fetch_google_news_data(terms, region, timespan):
+    return safe(src.fetch_google_news, terms, region, timespan)
+
+
 def _gdelt_completion_watch():
-    future = st.session_state.get("_gdelt_future")
-    if future is None:
-        return
-    if future.done():
-        try:
-            st.session_state["_gdelt_result"] = future.result()
-        except Exception as exc:
-            message = f"Global news (GDELT) is temporarily unavailable ({exc.__class__.__name__})."
-            st.session_state["_gdelt_result"] = (None, message, None, message, True)
-        st.session_state["_gdelt_future"] = None
+    rerun = False
+    pending = False
+    for future_key, result_key, fallback in (
+        ("_gdelt_future", "_gdelt_result",
+         lambda exc: (None, f"Global news (GDELT) is temporarily unavailable ({exc.__class__.__name__}).",
+                      None, "Global news timeline unavailable.", True)),
+        ("_google_news_future", "_google_news_result",
+         lambda exc: (None, f"Google News RSS is temporarily unavailable ({exc.__class__.__name__}).")),
+    ):
+        future = st.session_state.get(future_key)
+        if future is None:
+            continue
+        if future.done():
+            try:
+                st.session_state[result_key] = future.result()
+            except Exception as exc:
+                st.session_state[result_key] = fallback(exc)
+            st.session_state[future_key] = None
+            rerun = True
+        else:
+            pending = True
+    if rerun:
         st.rerun()
-    else:
+    elif pending:
         st.caption("Global news is loading in the background; other sources are available meanwhile.")
 
 
@@ -149,6 +165,7 @@ with st.sidebar:
     st.markdown("**Data sources**")
     st.markdown(
         f"- 📰 Global news (GDELT) ✅\n"
+        f"- 🗞️ Google News RSS ✅ (backup)\n"
         f"- 💬 Hacker News ✅\n"
         f"- 💼 Adzuna jobs {'✅' if src.get_secret('ADZUNA_APP_ID') else '⚪ not set up'}\n"
         f"- 🏛️ USAJobs {'✅' if src.get_secret('USAJOBS_API_KEY') else '⚪ not set up'}\n"
@@ -183,8 +200,11 @@ gdelt_key = (news_terms, reg["gdelt_country"], win["gdelt"])
 if st.session_state.get("_gdelt_key") != gdelt_key:
     st.session_state["_gdelt_key"] = gdelt_key
     st.session_state["_gdelt_result"] = None
+    st.session_state["_google_news_result"] = None
     st.session_state["_gdelt_future"] = gdelt_executor().submit(
         _fetch_gdelt_data, news_terms, reg["gdelt_country"], win["gdelt"])
+    st.session_state["_google_news_future"] = gdelt_executor().submit(
+        _fetch_google_news_data, news_terms, region, win["gdelt"])
 
 gdelt_future = st.session_state.get("_gdelt_future")
 gdelt_result = st.session_state.get("_gdelt_result")
@@ -193,25 +213,46 @@ if gdelt_result is None and gdelt_future is not None and gdelt_future.done():
         gdelt_result = gdelt_future.result()
     except Exception as exc:
         message = f"Global news (GDELT) is temporarily unavailable ({exc.__class__.__name__})."
-        gdelt_result = (None, message, None, message, True)
+        gdelt_result = (None, message, None, "Global news timeline unavailable.", True)
     st.session_state["_gdelt_result"] = gdelt_result
     st.session_state["_gdelt_future"] = None
     gdelt_future = None
 
+google_future = st.session_state.get("_google_news_future")
+google_result = st.session_state.get("_google_news_result")
+if google_result is None and google_future is not None and google_future.done():
+    try:
+        google_result = google_future.result()
+    except Exception as exc:
+        google_result = (None, f"Google News RSS is temporarily unavailable ({exc.__class__.__name__}).")
+    st.session_state["_google_news_result"] = google_result
+    st.session_state["_google_news_future"] = None
+    google_future = None
+
 if gdelt_result is None:
-    news, news_err = None, None
+    gdelt_news, news_err = None, None
     timeline, timeline_err = None, None
+    gdelt_failed = False
 else:
-    news, news_err, timeline, timeline_err, gdelt_failed = gdelt_result
+    gdelt_news, news_err, timeline, timeline_err, gdelt_failed = gdelt_result
+
+if google_result is None:
+    google_news, google_err = None, None
+else:
+    google_news, google_err = google_result
 
 gdelt_pending = gdelt_future is not None
-if gdelt_pending:
+google_pending = google_future is not None
+news_pending = gdelt_pending or google_pending
+if news_pending:
     st.fragment(run_every=1)(_gdelt_completion_watch)()
 gdelt_unavailable = bool(
     (gdelt_result is not None and gdelt_failed) or news_err or timeline_err
     or any("global news (gdelt) is temporarily unavailable" in note.lower() for note in stale_notes)
 )
-news = news if news is not None else pd.DataFrame(columns=["title", "url", "outlet", "published", "source_country", "outlets_carrying"])
+news = src.merge_news_sources(gdelt_news, google_news)
+if news is None:
+    news = pd.DataFrame(columns=src.NEWS_COLUMNS)
 
 hn, hn_err = (pd.DataFrame(columns=["title", "url", "discussion", "points", "comments", "published"]), None)
 if cfg["hn_terms"]:
@@ -246,7 +287,7 @@ tabs = st.tabs(["📊 Pulse Overview", "📰 Top Stories & Topics", "💼 Jobs",
 with tabs[0]:
     if gdelt_unavailable:
         st.warning("Global news is temporarily unavailable, showing other sources")
-    elif gdelt_pending:
+    elif news_pending:
         st.info("Global news is loading in the background; other sources are available meanwhile.")
     for note in stale_notes:
         st.info(note, icon="🕒")
@@ -304,7 +345,8 @@ with tabs[0]:
             top = news.sort_values("outlets_carrying", ascending=False).head(6)
             for _, r in top.iterrows():
                 st.markdown(f"<div class='sp-story'>• <a href='{r['url']}' target='_blank'>{r['title']}</a>"
-                            f" <span class='sp-muted'>— {r['outlet']}</span></div>", unsafe_allow_html=True)
+                            f" <span class='sp-muted'>— {r['outlet']} · {r['news_source']}</span></div>",
+                            unsafe_allow_html=True)
 
 # --------------------------------------------------------------------------- #
 # Tab 2 — Stories & topics
@@ -352,13 +394,15 @@ with tabs[1]:
         q = st.text_input("Filter headlines", placeholder="e.g. regulation, India, OpenAI")
         view = news if not q else news[news["title"].str.contains(q, case=False, na=False)]
         st.dataframe(
-            view[["published", "title", "outlet", "outlets_carrying", "url"]],
+            view[["published", "title", "outlet", "news_source", "outlets_carrying", "url", "google_url"]],
             column_config={
                 "published": st.column_config.DatetimeColumn("Seen", format="D MMM, HH:mm"),
                 "title": st.column_config.TextColumn("Headline", width="large"),
                 "outlet": "Outlet",
+                "news_source": "News source",
                 "outlets_carrying": st.column_config.NumberColumn("Outlets", help="How many outlets ran this headline"),
-                "url": st.column_config.LinkColumn("Link", display_text="Open ↗"),
+                "url": st.column_config.LinkColumn("Story link", display_text="Open ↗"),
+                "google_url": st.column_config.LinkColumn("Google News link", display_text="Open ↗"),
             }, hide_index=True, width="stretch", height=420)
 
     if cfg["hn_terms"]:

@@ -17,6 +17,8 @@ import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from xml.etree import ElementTree
 
 import pandas as pd
 import requests
@@ -31,6 +33,11 @@ GDELT_RETRY_DELAY = 6
 GDELT_FAILURE_TTL = 180
 GDELT_MIN_INTERVAL = 5.5
 logger = logging.getLogger(__name__)
+NEWS_COLUMNS = [
+    "title", "url", "outlet", "published", "source_country",
+    "outlets_carrying", "news_source", "google_url",
+]
+GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search"
 
 
 class SourceError(Exception):
@@ -151,8 +158,11 @@ def fetch_news(terms: tuple, country: str | None, timespan: str) -> pd.DataFrame
         "outlet": a.get("domain"),
         "published": _parse_gdelt_date(a.get("seendate")),
         "source_country": a.get("sourcecountry"),
+        "outlets_carrying": 1,
+        "news_source": "GDELT",
+        "google_url": None,
     } for a in data.get("articles", [])]
-    df = pd.DataFrame(rows, columns=["title", "url", "outlet", "published", "source_country"])
+    df = pd.DataFrame(rows, columns=NEWS_COLUMNS)
     if df.empty:
         return df
     # Remove syndicated duplicates (same headline published by many outlets),
@@ -162,6 +172,123 @@ def fetch_news(terms: tuple, country: str | None, timespan: str) -> pd.DataFrame
     counts = df.groupby("key")["outlet"].nunique().rename("outlets_carrying")
     df = df.drop_duplicates("key").merge(counts, on="key").drop(columns="key")
     return df.reset_index(drop=True)
+
+
+@st.cache_data(ttl=CACHE_SECONDS, show_spinner=False)
+def fetch_google_news(terms: tuple, region: str, timespan: str) -> pd.DataFrame:
+    """Fetch one no-key Google News RSS search for the complete sector keyword set."""
+    editions = {
+        "Global": {"hl": "en-US", "gl": "US", "ceid": "US:en"},
+        "India": {"hl": "en-IN", "gl": "IN", "ceid": "IN:en"},
+        "United States": {"hl": "en-US", "gl": "US", "ceid": "US:en"},
+    }
+    edition = editions.get(region)
+    if edition is None:
+        raise ValueError(f"Unsupported Google News edition: {region}")
+    when = {"1 day": "1d", "7 days": "7d", "30 days": "30d"}.get(timespan, timespan)
+    query = " OR ".join(f'"{term}"' for term in terms)
+    if when:
+        query = f"({query}) when:{when}"
+    try:
+        response = requests.get(
+            GOOGLE_NEWS_RSS_URL,
+            params={"q": query, **edition},
+            timeout=15,
+            headers={"User-Agent": USER_AGENT},
+        )
+        response.raise_for_status()
+        root = ElementTree.fromstring(response.content)
+    except (requests.RequestException, ElementTree.ParseError) as exc:
+        raise SourceError(f"Google News RSS is unavailable ({exc.__class__.__name__}).")
+
+    country = {"India": "IN", "United States": "US"}.get(region)
+    rows = []
+    for item in root.findall("./channel/item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        if not title or not link:
+            continue
+        source = item.find("source")
+        outlet = (source.text or "").strip() if source is not None else ""
+        if outlet and title.endswith(f" - {outlet}"):
+            title = title[:-(len(outlet) + 3)].strip()
+        published_text = item.findtext("pubDate")
+        try:
+            published = parsedate_to_datetime(published_text) if published_text else pd.NaT
+            if not pd.isna(published) and published.tzinfo is None:
+                published = published.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError, OverflowError):
+            published = pd.NaT
+        rows.append({
+            "title": title,
+            "url": link,
+            "outlet": outlet or "Google News",
+            "published": published,
+            "source_country": country,
+            "outlets_carrying": 1,
+            "news_source": "Google News",
+            "google_url": None,
+        })
+    return pd.DataFrame(rows, columns=NEWS_COLUMNS)
+
+
+def merge_news_sources(gdelt: pd.DataFrame | None, google: pd.DataFrame | None) -> pd.DataFrame:
+    """Merge both feeds by normalized headline while retaining provider links."""
+    frames = []
+    for frame, provider in ((gdelt, "GDELT"), (google, "Google News")):
+        if frame is None or frame.empty:
+            continue
+        normalized = frame.copy()
+        for column, default in (
+            ("outlet", "Unknown outlet"),
+            ("source_country", None),
+            ("outlets_carrying", 1),
+            ("google_url", None),
+        ):
+            if column not in normalized:
+                normalized[column] = default
+        if "news_source" not in normalized:
+            normalized["news_source"] = provider
+        normalized["_key"] = normalized["title"].fillna("").str.lower().str.replace(
+            r"[^a-z0-9 ]", "", regex=True
+        ).str.strip()
+        frames.append(normalized[normalized["_key"] != ""])
+
+    if not frames:
+        return pd.DataFrame(columns=NEWS_COLUMNS)
+
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    rows = []
+    for _, group in combined.groupby("_key", sort=False):
+        sources = []
+        for value in group["news_source"].fillna(""):
+            for label in str(value).split(" + "):
+                if label and label not in sources:
+                    sources.append(label)
+        preferred = group[group["news_source"].str.contains("GDELT", na=False)]
+        primary = (preferred.iloc[0] if not preferred.empty else group.iloc[0])
+        google_rows = group[group["news_source"].str.contains("Google News", na=False)]
+        has_gdelt = any("GDELT" in label for label in sources)
+        google_url = None
+        if has_gdelt and not google_rows.empty:
+            google_url = next(
+                (url for url in google_rows["url"].tolist() if isinstance(url, str) and url),
+                None,
+            )
+        outlet_count = pd.to_numeric(group["outlets_carrying"], errors="coerce").max()
+        if pd.isna(outlet_count):
+            outlet_count = 1
+        rows.append({
+            "title": primary["title"],
+            "url": primary["url"],
+            "outlet": primary["outlet"],
+            "published": primary["published"],
+            "source_country": primary["source_country"],
+            "outlets_carrying": outlet_count,
+            "news_source": " + ".join(sources),
+            "google_url": google_url,
+        })
+    return pd.DataFrame(rows, columns=NEWS_COLUMNS).reset_index(drop=True)
 
 
 @st.cache_data(ttl=CACHE_SECONDS, show_spinner=False)

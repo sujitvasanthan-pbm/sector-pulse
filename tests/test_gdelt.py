@@ -6,6 +6,7 @@ import threading
 
 import pandas as pd
 import pytest
+from config import SECTORS
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -23,6 +24,20 @@ class FakeResponse:
         if self.invalid_json:
             raise ValueError("not JSON")
         return self.payload
+
+
+class FakeRSSResponse:
+    status_code = 200
+    content = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss><channel><item>
+      <title>Policy changes announced - Policy Daily</title>
+      <link>https://news.google.com/rss/articles/policy-story</link>
+      <pubDate>Fri, 20 Nov 2026 12:00:00 GMT</pubDate>
+      <source url="https://policydaily.example">Policy Daily</source>
+    </item></channel></rss>"""
+
+    def raise_for_status(self):
+        return None
 
 
 @pytest.fixture
@@ -116,6 +131,80 @@ def test_gdelt_failure_cooldown_avoids_repeated_network_calls(monkeypatch, gdelt
     assert sources.GDELT_FAILURE_TTL == 180
 
 
+@pytest.mark.parametrize("sector", ["AI & Tech", "Public Policy & Government", "Climate & Energy"])
+def test_google_news_returns_stories_for_priority_sectors(monkeypatch, sector):
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeRSSResponse()
+
+    monkeypatch.setattr(sources.requests, "get", fake_get)
+    sources.fetch_google_news.clear()
+
+    stories = sources.fetch_google_news(tuple(SECTORS[sector]["news_terms"]), "Global", "7d")
+
+    assert len(stories) == 1
+    assert stories.iloc[0]["title"] == "Policy changes announced"
+    assert stories.iloc[0]["news_source"] == "Google News"
+    assert stories.iloc[0]["url"].startswith("https://news.google.com/")
+    assert len(calls) == 1
+    assert calls[0][1]["params"]["gl"] == "US"
+    assert " OR " in calls[0][1]["params"]["q"]
+    assert "when:7d" in calls[0][1]["params"]["q"]
+
+
+@pytest.mark.parametrize(
+    ("region", "country", "language"),
+    [("India", "IN", "en-IN"), ("United States", "US", "en-US")],
+)
+def test_google_news_uses_regional_edition_and_requested_time_window(
+    monkeypatch, region, country, language
+):
+    captured = {}
+
+    def fake_get(url, **kwargs):
+        captured.update(kwargs)
+        return FakeRSSResponse()
+
+    monkeypatch.setattr(sources.requests, "get", fake_get)
+    sources.fetch_google_news.clear()
+    sources.fetch_google_news(("public policy", "legislation"), region, "1d")
+
+    assert captured["params"]["hl"] == language
+    assert captured["params"]["gl"] == country
+    assert captured["params"]["ceid"] == f"{country}:en"
+    assert "when:1d" in captured["params"]["q"]
+
+
+def test_merging_duplicate_headlines_keeps_both_provider_links():
+    gdelt = pd.DataFrame([{
+        "title": "Policy Changes Announced!",
+        "url": "https://publisher.example/policy",
+        "outlet": "Policy Daily",
+        "published": pd.Timestamp("2026-11-20T12:00:00Z"),
+        "source_country": "US",
+        "outlets_carrying": 2,
+        "news_source": "GDELT",
+    }])
+    google = pd.DataFrame([{
+        "title": "policy changes announced",
+        "url": "https://news.google.com/rss/articles/policy",
+        "outlet": "Policy Daily",
+        "published": pd.Timestamp("2026-11-20T12:00:00Z"),
+        "source_country": "US",
+        "outlets_carrying": 1,
+        "news_source": "Google News",
+    }])
+
+    merged = sources.merge_news_sources(gdelt, google)
+
+    assert len(merged) == 1
+    assert merged.iloc[0]["news_source"] == "GDELT + Google News"
+    assert merged.iloc[0]["url"] == "https://publisher.example/policy"
+    assert merged.iloc[0]["google_url"] == "https://news.google.com/rss/articles/policy"
+
+
 def test_dashboard_renders_other_tabs_when_gdelt_fails(monkeypatch):
     from streamlit.testing.v1 import AppTest
 
@@ -148,6 +237,10 @@ def test_dashboard_renders_other_tabs_when_gdelt_fails(monkeypatch):
         sources, "fetch_usajobs",
         lambda *args, **kwargs: pd.DataFrame(columns=sources.JOB_COLUMNS),
     )
+    monkeypatch.setattr(
+        sources, "fetch_google_news",
+        lambda *args, **kwargs: pd.DataFrame(columns=sources.NEWS_COLUMNS),
+    )
 
     app = AppTest.from_file(
         os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py"),
@@ -161,9 +254,11 @@ def test_dashboard_renders_other_tabs_when_gdelt_fails(monkeypatch):
     assert len(app.tabs) == 6
 
     release.set()
-    if future is not None:
-        future.result(timeout=10)
-        app.run()
+    for future_key in ("_gdelt_future", "_google_news_future"):
+        pending_future = app.session_state.get(future_key)
+        if pending_future is not None:
+            pending_future.result(timeout=10)
+    app.run()
 
     assert not app.exception
     assert len(app.tabs) == 6
