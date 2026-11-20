@@ -170,7 +170,9 @@ def fetch_news(terms: tuple, country: str | None, timespan: str) -> pd.DataFrame
     df["key"] = df["title"].str.lower().str.replace(r"[^a-z0-9 ]", "", regex=True).str.strip()
     df = df[df["key"].str.len() > 15]
     counts = df.groupby("key")["outlet"].nunique().rename("outlets_carrying")
-    df = df.drop_duplicates("key").merge(counts, on="key").drop(columns="key")
+    df = df.drop(columns="outlets_carrying").drop_duplicates("key").merge(
+        counts, on="key"
+    ).drop(columns="key")
     return df.reset_index(drop=True)
 
 

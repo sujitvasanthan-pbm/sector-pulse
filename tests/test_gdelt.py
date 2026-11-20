@@ -205,6 +205,20 @@ def test_merging_duplicate_headlines_keeps_both_provider_links():
     assert merged.iloc[0]["google_url"] == "https://news.google.com/rss/articles/policy"
 
 
+def test_gdelt_success_preserves_provider_and_outlet_counts(monkeypatch):
+    monkeypatch.setattr(sources, "_gdelt_request", lambda params: {"articles": [
+        {"title": "Major public policy changes announced", "url": "https://a.example/policy",
+         "domain": "a.example", "seendate": "20261120T120000Z", "sourcecountry": "US"},
+        {"title": "Major public policy changes announced", "url": "https://b.example/policy",
+         "domain": "b.example", "seendate": "20261120T120000Z", "sourcecountry": "US"},
+    ]})
+    sources.fetch_news.clear()
+    result = sources.fetch_news(("public policy",), None, "7d")
+    assert len(result) == 1
+    assert result.iloc[0]["outlets_carrying"] == 2
+    assert result.iloc[0]["news_source"] == "GDELT"
+
+
 def test_dashboard_renders_other_tabs_when_gdelt_fails(monkeypatch):
     from streamlit.testing.v1 import AppTest
 
