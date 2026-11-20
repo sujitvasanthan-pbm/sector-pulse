@@ -145,10 +145,13 @@ Data refreshes hourly. Always open the source links before relying on anything h
 # --------------------------------------------------------------------------- #
 # Fetch data (each source fails independently)
 # --------------------------------------------------------------------------- #
-with st.spinner("Gathering global news coverage… (the free news API allows one request every 5 seconds, "
-                "so the first load takes ~15 seconds; after that it's cached)"):
+with st.spinner("Gathering global news coverage… GDELT requests have a short timeout and one retry."):
     news, news_err = safe(src.fetch_news, news_terms, reg["gdelt_country"], win["gdelt"])
     timeline, timeline_err = safe(src.fetch_news_timeline, news_terms, reg["gdelt_country"], win["gdelt"])
+gdelt_unavailable = bool(
+    news_err or timeline_err
+    or any("global news (gdelt) is temporarily unavailable" in note.lower() for note in stale_notes)
+)
 news = news if news is not None else pd.DataFrame(columns=["title", "url", "outlet", "published", "source_country", "outlets_carrying"])
 
 hn, hn_err = (pd.DataFrame(columns=["title", "url", "discussion", "points", "comments", "published"]), None)
@@ -182,8 +185,8 @@ tabs = st.tabs(["📊 Pulse Overview", "📰 Top Stories & Topics", "💼 Jobs",
 # Tab 1 — Overview
 # --------------------------------------------------------------------------- #
 with tabs[0]:
-    if news_err:
-        st.warning(news_err)
+    if gdelt_unavailable:
+        st.warning("Global news is temporarily unavailable, showing other sources")
     for note in stale_notes:
         st.info(note, icon="🕒")
     c1, c2, c3, c4 = st.columns(4)
@@ -247,7 +250,10 @@ with tabs[0]:
 # --------------------------------------------------------------------------- #
 with tabs[1]:
     if news.empty:
-        st.info(news_err or "No stories found for this selection. Try a longer time window or Global region.")
+        if gdelt_unavailable:
+            st.warning("Global news is temporarily unavailable, showing other sources")
+        else:
+            st.info("No stories found for this selection. Try a longer time window or Global region.")
     else:
         st.subheader("Themes")
         use_ai = False

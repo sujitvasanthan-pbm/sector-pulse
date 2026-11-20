@@ -12,6 +12,7 @@ takes down the rest of the dashboard. Results are cached for an hour.
 """
 
 import os
+import logging
 import re
 import threading
 import time
@@ -25,6 +26,11 @@ from config import CACHE_SECONDS
 
 USER_AGENT = "SectorPulse/1.0 (student dashboard; uses official APIs only)"
 TIMEOUT = 25
+GDELT_TIMEOUT = 15
+GDELT_RETRY_DELAY = 6
+GDELT_FAILURE_TTL = 180
+GDELT_MIN_INTERVAL = 5.5
+logger = logging.getLogger(__name__)
 
 
 class SourceError(Exception):
@@ -48,47 +54,66 @@ def get_secret(name: str) -> str | None:
 # --------------------------------------------------------------------------- #
 _gdelt_lock = threading.Lock()
 _gdelt_last_call = [0.0]
-_gdelt_down_until = [0.0]  # after a failure, pause GDELT calls briefly instead of retrying on every click
+_gdelt_down_until = [0.0]  # short failure cooldown, separate from successful-result caching
 GDELT_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 
 
-def _gdelt_request(params: dict, attempts: int = 3) -> dict:
-    """Call GDELT politely: at most one request every ~5.5 seconds, with retries."""
-    if time.time() < _gdelt_down_until[0]:
-        raise SourceError("Global news (GDELT) is busy right now. The app will try again in a few minutes.")
+def _gdelt_request(params: dict) -> dict:
+    """Fetch and validate a GDELT response, with one bounded retry."""
+    if time.monotonic() < _gdelt_down_until[0]:
+        raise SourceError("Global news (GDELT) is temporarily unavailable.")
     last_problem = "no response"
-    for attempt in range(attempts):
+    for attempt in range(2):
         with _gdelt_lock:
-            wait = 5.5 - (time.time() - _gdelt_last_call[0])
+            wait = GDELT_MIN_INTERVAL - (time.time() - _gdelt_last_call[0])
             if wait > 0:
                 time.sleep(wait)
             try:
-                resp = requests.get(GDELT_URL, params=params, timeout=TIMEOUT,
+                resp = requests.get(GDELT_URL, params=params, timeout=GDELT_TIMEOUT,
                                     headers={"User-Agent": USER_AGENT})
             except requests.RequestException as exc:
                 last_problem = f"network error ({exc.__class__.__name__})"
                 _gdelt_last_call[0] = time.time()
-                continue
+                logger.warning("GDELT request failed: status=unavailable response=%r", str(exc)[:200])
+                if attempt == 0:
+                    time.sleep(GDELT_RETRY_DELAY)
+                    continue
+                break
             _gdelt_last_call[0] = time.time()
 
         text = resp.text.strip()
-        if resp.status_code == 200 and text.startswith("{"):
+        if not 200 <= resp.status_code < 300:
+            last_problem = f"HTTP {resp.status_code}"
+        elif not text:
+            _gdelt_down_until[0] = 0.0
+            return {}  # GDELT may return an empty body when nothing matches
+        else:
             try:
-                return resp.json()
+                data = resp.json()
             except ValueError:
-                last_problem = "unreadable response"
-                continue
-        if resp.status_code == 200 and not text:
-            return {}  # GDELT returns an empty body when nothing matches
-        if "limit requests" in text.lower() or resp.status_code == 429:
-            last_problem = "GDELT is rate-limiting requests right now"
-            if attempt < attempts - 1:
-                time.sleep(6 + 4 * attempt)
-            continue
-        last_problem = text[:160] or f"HTTP {resp.status_code}"
-        break
-    _gdelt_down_until[0] = time.time() + 180
-    raise SourceError(f"Global news (GDELT) is unavailable: {last_problem}. Try again in a few minutes.")
+                data = None
+                last_problem = "response was not valid JSON"
+
+            expected_key = "articles" if params.get("mode") == "artlist" else \
+                "timeline" if params.get("mode") == "timelinevolraw" else None
+            if data is not None and not isinstance(data, dict):
+                last_problem = "JSON response was not an object"
+                data = None
+            elif data is not None and expected_key and (
+                    expected_key not in data or not isinstance(data[expected_key], list)):
+                last_problem = f"JSON response did not contain a valid {expected_key} list"
+                data = None
+            elif data is not None:
+                _gdelt_down_until[0] = 0.0
+                return data
+
+        logger.warning("GDELT request failed: status=%s response=%r",
+                       resp.status_code, text[:200])
+        if attempt == 0:
+            time.sleep(GDELT_RETRY_DELAY)
+
+    _gdelt_down_until[0] = time.monotonic() + GDELT_FAILURE_TTL
+    raise SourceError(f"Global news (GDELT) is temporarily unavailable ({last_problem}).")
 
 
 def _gdelt_query(terms: list[str], country: str | None) -> str:
@@ -145,7 +170,7 @@ def fetch_news_timeline(terms: tuple, country: str | None, timespan: str) -> pd.
     data = _gdelt_request({
         "query": _gdelt_query(list(terms), country),
         "mode": "timelinevolraw", "format": "json", "timespan": timespan,
-    }, attempts=2)
+    })
     series = (data.get("timeline") or [{}])[0].get("data", [])
     df = pd.DataFrame([{"date": _parse_gdelt_date(p.get("date")),
                         "articles": p.get("value", 0),
