@@ -1,6 +1,6 @@
 # Replit configuration for Sector Pulse (a Streamlit app).
 modules = ["python-3.12"]
-run = "pip install -q -r requirements.txt && streamlit run app.py --server.port 8080 --server.address 0.0.0.0 --server.headless true"
+run = "pip install -q -r requirements.txt && streamlit run app.py --server.port 8080 --server.address 0.0.0.0 --server.headless true --server.enableCORS=false --server.enableWebsocketCompression=false"
 
 [nix]
 channel = "stable-24_05"
@@ -8,7 +8,7 @@ channel = "stable-24_05"
 [deployment]
 deploymentTarget = "autoscale"
 build = ["sh", "-c", "pip install -r requirements.txt"]
-run = ["sh", "-c", "streamlit run app.py --server.port 8080 --server.address 0.0.0.0 --server.headless true"]
+run = ["sh", "-c", "streamlit run app.py --server.port 8080 --server.address 0.0.0.0 --server.headless true --server.enableCORS=false --server.enableWebsocketCompression=false"]
 
 [[ports]]
 localPort = 8080
